@@ -145,6 +145,10 @@ canvas { display: block; touch-action: pan-x; }
         <span class="lbl">Clic</span>
         <button class="switch" id="metro" aria-pressed="true"><span class="led"></span>Métronome</button>
       </div>
+      <div class="ctrl">
+        <span class="lbl">Micro</span>
+        <button class="switch" id="calib" aria-pressed="false"><span class="led"></span><span id="calibTxt">Calibrer</span></button>
+      </div>
     </div>
   </section>
 
@@ -162,7 +166,7 @@ canvas { display: block; touch-action: pan-x; }
       <ol>
         <li>Choisissez l'instrument de la piste.</li>
         <li>Touchez <b>Enregistrer</b> : 4 clics de décompte, puis chantez pendant toute la boucle.</li>
-        <li>L'air devient des notes. Ajustez avec <b>Tonalité</b>, <b>Caler sur</b> et l'octave.</li>
+        <li>Vous voyez votre voix tracée en direct, puis l'air devient des notes. Ajustez avec <b>Tonalité</b>, <b>Caler sur</b> et l'octave.</li>
         <li>Touchez une note pour la supprimer.</li>
       </ol>
     </div>
@@ -179,6 +183,8 @@ canvas { display: block; touch-action: pan-x; }
       <h2>Pour une bonne détection</h2>
       <ul>
         <li>Mettez un casque : le clic ne repasse pas dans le micro.</li>
+        <li>Calibrez le micro une fois (bouton <b>Micro</b>) : les notes tombent pile sur le temps.</li>
+        <li>Pour la batterie, touchez <b>Apprendre mes sons</b> : l'app reconnaît ensuite votre façon de faire « boum », « tchak » et « ts ».</li>
         <li>Articulez « da da da » plutôt qu'un long « mmm » : les notes se séparent mieux.</li>
         <li>En sifflant, baissez d'une octave.</li>
         <li>Pour un fichier importé, réglez le tempo d'abord.</li>
@@ -231,7 +237,7 @@ function exampleProject() {
   };
 }
 function blankProject(p) {
-  return { bpm: p.bpm, bars: p.bars, quant: p.quant, key: 'auto', metro: p.metro, example: false,
+  return { bpm: p.bpm, bars: p.bars, quant: p.quant, key: 'auto', metro: p.metro, example: false, latency: p.latency, drumProfile: p.drumProfile,
     tracks: [newMel('piano'), newDrums()] };
 }
 function newMel(inst) { return { id: uid(), kind: 'mel', inst, octave: INST[inst].oct, muted: false, info: '', raw: [] }; }
@@ -453,48 +459,117 @@ function tick() {
 }
 function nowBeat() { return play ? (ctx.currentTime - play.start - (ctx.outputLatency || 0)) / spb() : null; }
 
-/* ---------- Enregistrement ---------- */
-let recBusy = false;
-async function recordTrack(t) {
-  if (recBusy) return;
+/* ---------- Micro ---------- */
+let micBusy = false;
+const wait = ms => new Promise(r => setTimeout(r, ms));
+function latency() {
+  if (typeof project.latency === 'number') return project.latency;
+  return (ctx.outputLatency || 0) + (ctx.baseLatency || 0) + 0.03;
+}
+async function openMic() {
   ensureCtx();
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { micBlocked(); return; }
-  let stream;
-  recBusy = true;
-  try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: true } }); }
-  catch (e) { recBusy = false; micBlocked(); return; }
-  const src = ctx.createMediaStreamSource(stream), proc = ctx.createScriptProcessor(2048, 1, 1), sink = gainNode(ctx.destination, 0);
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return null;
+  try {
+    return await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 } });
+  } catch (e) { return null; }
+}
+const CHUNK = 1024;
+function startCapture(stream, onChunk) {
+  const sr = ctx.sampleRate, src = ctx.createMediaStreamSource(stream), proc = ctx.createScriptProcessor(CHUNK, 1, 1), sink = gainNode(ctx.destination, 0);
   src.connect(proc); proc.connect(sink);
-  const rec = { id: t.id, chunks: [], firstT: null, stream, src, proc, sink, level: 0 };
+  const cap = { stream, src, proc, sink, sr, chunks: [], n: 0, anchor: Infinity, level: 0 };
   proc.onaudioprocess = ev => {
-    const d = ev.inputBuffer.getChannelData(0);
-    if (rec.firstT === null) rec.firstT = ctx.currentTime - d.length / ctx.sampleRate;
-    rec.chunks.push(new Float32Array(d));
-    let s = 0; for (let i = 0; i < d.length; i += 4) s += d[i] * d[i];
-    rec.level = Math.sqrt(s / (d.length / 4));
+    const d = new Float32Array(ev.inputBuffer.getChannelData(0));
+    cap.chunks.push(d); cap.n += d.length;
+    // Le plus petit écart observé donne l'ancrage temporel le plus stable
+    cap.anchor = Math.min(cap.anchor, ctx.currentTime - cap.n / sr);
+    let s = 0; for (let i = 0; i < d.length; i += 2) s += d[i] * d[i];
+    cap.level = Math.sqrt(s / (d.length / 2));
+    if (onChunk) onChunk(cap, d);
   };
+  return cap;
+}
+function stopCapture(cap, keepStream) {
+  try { cap.proc.onaudioprocess = null; cap.proc.disconnect(); cap.src.disconnect(); cap.sink.disconnect(); } catch (e) {}
+  if (!keepStream) cap.stream.getTracks().forEach(tr => tr.stop());
+  const all = new Float32Array(cap.n); let o = 0;
+  for (const c of cap.chunks) { all.set(c, o); o += c.length; }
+  return all;
+}
+function getRange(cap, start, len) {
+  const out = new Float32Array(len);
+  for (let i = 0; i < len; i++) {
+    const g = start + i, ci = Math.floor(g / CHUNK), c = cap.chunks[ci];
+    out[i] = c ? c[g - ci * CHUNK] || 0 : 0;
+  }
+  return out;
+}
+function sliceFrom(all, cap, t0, dur) {
+  const sr = cap.sr, s0 = Math.round((t0 - cap.anchor + latency()) * sr), len = Math.round(dur * sr);
+  if (s0 >= 0) return all.slice(s0, Math.min(all.length, s0 + len));
+  const x = new Float32Array(len);
+  x.set(all.subarray(0, Math.max(0, Math.min(all.length, len + s0))), -s0);
+  return x;
+}
+
+/* ---------- Enregistrement ---------- */
+async function recordTrack(t) {
+  if (micBusy || calibrating) return;
+  micBusy = true;
+  const stream = await openMic();
+  if (!stream) { micBusy = false; micBlocked(); return; }
+  const rec = { id: t.id, kind: t.kind, octave: t.octave || 0, live: [], hits: [], pend: [], peak: 0, eh: [], floor: null, lastHit: -1e9, cur: NaN };
+  rec.cap = startCapture(stream, (cap, d) => liveChunk(rec, cap, d));
   clearExample();
   startTransport({ countIn: 4, rec });
   renderTracks();
 }
-function cleanupMic(rec) {
-  try { rec.proc.disconnect(); rec.src.disconnect(); rec.sink.disconnect(); } catch (e) {}
-  rec.stream.getTracks().forEach(tr => tr.stop());
-  recBusy = false;
+function liveChunk(rec, cap, d) {
+  if (!play || play.rec !== rec) return;
+  const sr = cap.sr, beatAt = tt => (tt - latency() - play.start) / spb();
+  rec.level = cap.level;
+  if (rec.kind === 'mel') {
+    rec.peak = Math.max(rec.peak * 0.998, cap.level);
+    let m = NaN;
+    if (cap.level > Math.max(0.005, rec.peak * 0.12)) {
+      const need = Math.ceil((YIN_W + Math.floor(11025 / 65) + 4) * sr / 11025);
+      if (cap.n >= need) {
+        const { y, sr: r } = downsample(getRange(cap, cap.n - need, need), sr, 11025);
+        const f = yinFrame(y, 0, r, new Float32Array(Math.floor(r / 65) + 1));
+        if (f > 0) m = 69 + 12 * Math.log2(f / 440);
+      }
+    }
+    rec.cur = m;
+    rec.live.push({ b: beatAt(cap.anchor + cap.n / sr - 0.03), m });
+  } else {
+    const B = 256, base = cap.n - d.length;
+    for (let i = 0; i + B <= d.length; i += B) {
+      let e = 0; for (let j = i; j < i + B; j++) e += d[j] * d[j];
+      const le = 10 * Math.log10(e / B + 1e-10), idx = base + i;
+      rec.floor = rec.floor === null ? le : Math.min(le, rec.floor + 0.03);
+      const pm = rec.eh.length ? Math.min(...rec.eh) : le;
+      if (le - pm > 7 && le > rec.floor + 15 && (idx - rec.lastHit) / sr > 0.09) {
+        rec.pend.push({ idx, b: beatAt(cap.anchor + idx / sr) }); rec.lastHit = idx;
+      }
+      rec.eh.push(le); if (rec.eh.length > 3) rec.eh.shift();
+    }
+    const len = Math.round(0.05 * sr);
+    rec.pend = rec.pend.filter(p => {
+      if (p.idx + len > cap.n) return true;
+      const { y, sr: r } = downsample(getRange(cap, p.idx, len), sr, 22050);
+      rec.hits.push({ b: p.b, k: classifyF(features(y, 0, r)) });
+      return false;
+    });
+  }
 }
+function cleanupMic(rec) { stopCapture(rec.cap); micBusy = false; }
 function finishRecording(p) {
-  const rec = p.rec; cleanupMic(rec);
+  const rec = p.rec, all = stopCapture(rec.cap); micBusy = false;
   const t = project.tracks.find(x => x.id === rec.id); if (!t) return;
-  const sr = ctx.sampleRate; let total = 0; rec.chunks.forEach(c => total += c.length);
-  if (rec.firstT === null || !total) { toast('Aucun son capté.'); return; }
-  const all = new Float32Array(total); let o = 0; for (const c of rec.chunks) { all.set(c, o); o += c.length; }
-  const lat = (ctx.outputLatency || 0) + (ctx.baseLatency || 0) + 0.015;
-  const s0 = Math.round((p.start - rec.firstT + lat) * sr), len = Math.round((p.L * spb() + 0.3) * sr);
-  let x;
-  if (s0 >= 0) x = all.subarray(s0, Math.min(total, s0 + len));
-  else { x = new Float32Array(len); x.set(all.subarray(0, Math.max(0, Math.min(total, len + s0))), -s0); }
+  if (!all.length || !isFinite(rec.cap.anchor)) { toast('Aucun son capté.'); return; }
+  const x = sliceFrom(all, rec.cap, p.start, p.L * spb() + 0.3);
   t.info = 'Analyse…'; renderTracks();
-  setTimeout(() => analyzeInto(t, x, sr, false), 30);
+  setTimeout(() => analyzeInto(t, x, rec.cap.sr, false), 30);
 }
 async function importFile(t, file) {
   ensureCtx(); clearExample();
@@ -510,6 +585,68 @@ async function importFile(t, file) {
   setTimeout(() => analyzeInto(t, x, ab.sampleRate, true), 30);
 }
 
+/* ---------- Calibrage ---------- */
+let calibrating = false, calibMsg = '', learnMsg = '';
+async function calibrate() {
+  if (micBusy || calibrating) return;
+  if (play) stopTransport(true);
+  calibrating = true; micBusy = true;
+  const stream = await openMic();
+  if (!stream) { calibrating = false; micBusy = false; micBlocked(); return; }
+  const cap = startCapture(stream);
+  calibMsg = 'Casque sur les oreilles : tapez dans vos mains sur chacun des 10 clics.'; renderNotices(); renderDeck();
+  const iv = 0.6, N = 10, t0 = ctx.currentTime + 1;
+  for (let i = 0; i < N; i++) playClick(t0 + i * iv, i % 4 === 0);
+  await wait((1 + N * iv + 0.6) * 1000);
+  const all = stopCapture(cap); calibrating = false; micBusy = false;
+  const { y, sr } = downsample(all, cap.sr, 22050);
+  const ons = onsets(y, sr, 9, 0.2).map(s => cap.anchor + s);
+  const offs = [];
+  for (let i = 2; i < N; i++) {
+    const ct = t0 + i * iv; let best = null;
+    for (const o of ons) { const dd = o - ct; if (dd > -0.12 && dd < 0.45 && (best === null || Math.abs(dd) < Math.abs(best))) best = dd; }
+    if (best !== null) offs.push(best);
+  }
+  if (offs.length < 5) calibMsg = 'Pas assez de claps entendus. Réessayez en tapant plus fort, bien sur le clic.';
+  else {
+    offs.sort((a, b) => a - b);
+    const med = offs[offs.length >> 1];
+    project.latency = Math.max(0, Math.min(0.5, med)); save();
+    calibMsg = 'Décalage mesuré : ' + Math.round(project.latency * 1000) + ' ms. Vos prochains enregistrements seront recalés.';
+  }
+  renderNotices(); renderDeck();
+}
+async function learnDrums() {
+  if (micBusy || calibrating) return;
+  if (play) stopTransport(true);
+  micBusy = true; calibrating = true;
+  const stream = await openMic();
+  if (!stream) { micBusy = false; calibrating = false; micBlocked(); return; }
+  const prof = {};
+  try {
+    for (const [k, word] of [['kick', '« boum »'], ['snare', '« tchak »'], ['hat', '« ts »']]) {
+      learnMsg = 'Au bip, faites 4 ' + word + ' bien espacés.'; renderNotices();
+      await wait(1200);
+      playClick(ctx.currentTime + 0.02, true);
+      await wait(250);
+      const cap = startCapture(stream);
+      learnMsg = 'À vous : 4 ' + word + '…'; renderNotices();
+      await wait(3200);
+      const all = stopCapture(cap, true);
+      playClick(ctx.currentTime + 0.02, false);
+      const { y, sr } = downsample(all, cap.sr, 22050);
+      const fs = onsets(y, sr, 7, 0.15).map(s => features(y, Math.round(s * sr), sr)).filter(Boolean);
+      if (fs.length < 2) { learnMsg = 'Je n’ai pas assez entendu de ' + word + '. Recommencez, plus fort et plus près du micro.'; return; }
+      prof[k] = [0, 1, 2].map(j => { const v = fs.map(f => f[j]).sort((a, b) => a - b); return v[v.length >> 1]; });
+    }
+    project.drumProfile = prof; save();
+    learnMsg = 'Sons appris. Réenregistrez la batterie : la détection utilise maintenant votre voix.';
+  } finally {
+    stream.getTracks().forEach(tr => tr.stop());
+    micBusy = false; calibrating = false; renderNotices(); renderTracks();
+  }
+}
+
 /* ---------- Analyse ---------- */
 function downsample(x, sr, target) {
   const f = sr / target;
@@ -522,42 +659,59 @@ function downsample(x, sr, target) {
   return { y, sr: sr / f };
 }
 const pct = (arr, q) => { const s = Array.from(arr).sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(s.length * q))] || 0; };
+const arrMax = a => { let m = -Infinity; for (const v of a) if (v > m) m = v; return m; };
 
+const YIN_W = 384;
+function yinFrame(y, st, sr, d) {
+  const tauMax = d.length - 1, tauMin = Math.max(2, Math.floor(sr / 1800));
+  if (st + YIN_W + tauMax > y.length) return 0;
+  let run = 0; d[0] = 1;
+  for (let tau = 1; tau <= tauMax; tau++) {
+    let s = 0; for (let j = 0; j < YIN_W; j++) { const v = y[st + j] - y[st + j + tau]; s += v * v; }
+    run += s; d[tau] = run > 0 ? s * tau / run : 1;
+  }
+  let tau = -1;
+  for (let k = tauMin; k <= tauMax; k++) if (d[k] < 0.15) { while (k + 1 <= tauMax && d[k + 1] < d[k]) k++; tau = k; break; }
+  if (tau < 0) { let best = tauMin; for (let k = tauMin; k <= tauMax; k++) if (d[k] < d[best]) best = k; if (d[best] < 0.3) tau = best; }
+  if (tau < 0) return 0;
+  let bt = tau;
+  if (tau > tauMin && tau < tauMax) { const A = d[tau - 1], B = d[tau], C = d[tau + 1], den = A - 2 * B + C; if (den) bt = tau + 0.5 * (A - C) / den; }
+  return sr / bt;
+}
 function trackPitch(y, sr) {
-  const W = 384, tauMax = Math.floor(sr / 65), tauMin = Math.max(2, Math.floor(sr / 1800)), hop = 128, N = W + tauMax;
-  const frames = [];
+  const tauMax = Math.floor(sr / 65), hop = 64, N = YIN_W + tauMax, frames = [];
   for (let st = 0; st + N <= y.length; st += hop) {
-    let e = 0; for (let j = 0; j < W; j++) e += y[st + j] * y[st + j];
-    frames.push({ st, t: (st + W / 2) / sr, rms: Math.sqrt(e / W), f: 0 });
+    let e = 0; for (let j = 0; j < YIN_W; j++) e += y[st + j] * y[st + j];
+    frames.push({ st, t: (st + YIN_W / 2) / sr, rms: Math.sqrt(e / YIN_W), f: 0 });
   }
-  const rs = frames.map(f => f.rms);
-  const pk = pct(rs, 0.98), gate = Math.max(pk * 0.08, Math.min(pct(rs, 0.1) * 2.5, pk * 0.3), 0.003);
+  const rs = frames.map(f => f.rms), pk = pct(rs, 0.98);
+  const gate = Math.max(pk * 0.08, Math.min(pct(rs, 0.1) * 2.5, pk * 0.3), 0.003);
   const d = new Float32Array(tauMax + 1);
-  for (const fr of frames) {
-    if (fr.rms < gate) continue;
-    const st = fr.st; let run = 0; d[0] = 1;
-    for (let tau = 1; tau <= tauMax; tau++) {
-      let s = 0; for (let j = 0; j < W; j++) { const v = y[st + j] - y[st + j + tau]; s += v * v; }
-      run += s; d[tau] = run > 0 ? s * tau / run : 1;
-    }
-    let tau = -1;
-    for (let k = tauMin; k <= tauMax; k++) if (d[k] < 0.15) { while (k + 1 <= tauMax && d[k + 1] < d[k]) k++; tau = k; break; }
-    if (tau < 0) { let best = tauMin; for (let k = tauMin; k <= tauMax; k++) if (d[k] < d[best]) best = k; if (d[best] < 0.3) tau = best; }
-    if (tau < 0) continue;
-    let bt = tau;
-    if (tau > tauMin && tau < tauMax) { const A = d[tau - 1], B = d[tau], C = d[tau + 1], den = A - 2 * B + C; if (den) bt = tau + 0.5 * (A - C) / den; }
-    fr.f = sr / bt;
-  }
+  for (const fr of frames) if (fr.rms >= gate) fr.f = yinFrame(y, fr.st, sr, d);
   return frames;
 }
+function onsets(y, sr, rise = 7, refr = 0.09) {
+  const W = 256, hop = 64, le = [];
+  for (let st = 0; st + W <= y.length; st += hop) {
+    let e = 0; for (let j = 0; j < W; j++) e += y[st + j] * y[st + j];
+    le.push(10 * Math.log10(e / W + 1e-10));
+  }
+  const floor = pct(le, 0.2), peak = arrMax(le), out = []; let last = -1e9;
+  for (let n = 4; n < le.length; n++) {
+    const pm = Math.min(le[n - 1], le[n - 2], le[n - 3], le[n - 4]);
+    if (le[n] - pm > rise && le[n] > Math.min(floor + 14, peak - 12) && le[n] > peak - 32 && (n - last) * hop / sr > refr) {
+      out.push((n * hop + W / 2) / sr); last = n;
+    }
+  }
+  return out;
+}
 function segment(frames) {
-  const hop = frames.length > 1 ? frames[1].t - frames[0].t : 0.0116;
-  const m = frames.map(f => f.f > 0 ? 69 + 12 * Math.log2(f.f / 440) : NaN);
-  const mf = m.map((v, i) => {
-    if (isNaN(v)) return NaN;
-    const w = []; for (let k = i - 2; k <= i + 2; k++) if (k >= 0 && k < m.length && !isNaN(m[k])) w.push(m[k]);
-    w.sort((a, b) => a - b); return w[w.length >> 1];
-  });
+  const hop = frames.length > 1 ? frames[1].t - frames[0].t : 0.0058;
+  const m0 = frames.map(f => f.f > 0 ? 69 + 12 * Math.log2(f.f / 440) : NaN);
+  const med = (arr, i, r) => { const w = []; for (let k = i - r; k <= i + r; k++) if (k >= 0 && k < arr.length && !isNaN(arr[k])) w.push(arr[k]); w.sort((a, b) => a - b); return w.length ? w[w.length >> 1] : NaN; };
+  // Corrige les sauts d'octave isolés
+  const m = m0.map((v, i) => { if (isNaN(v)) return v; const md = med(m0, i, 8); if (Math.abs(v - 12 - md) < 1) return v - 12; if (Math.abs(v + 12 - md) < 1) return v + 12; return v; });
+  const mf = m.map((v, i) => isNaN(v) ? NaN : med(m, i, 3));
   const notes = []; let cur = null, gap = 0;
   const close = () => {
     if (cur && cur.ps.length * hop >= 0.07) {
@@ -569,7 +723,7 @@ function segment(frames) {
   };
   for (let i = 0; i < frames.length; i++) {
     const v = mf[i], r = frames[i].rms;
-    if (isNaN(v)) { if (cur && ++gap > 3) close(); continue; }
+    if (isNaN(v)) { if (cur && ++gap * hop > 0.035) close(); continue; }
     gap = 0;
     if (cur) {
       const ref = cur.recent.reduce((a, b) => a + b, 0) / cur.recent.length;
@@ -579,41 +733,71 @@ function segment(frames) {
       if (split) close();
     }
     if (!cur) cur = { t0: frames[i].t - hop / 2, ps: [], recent: [], maxR: 0, dip: false };
-    cur.ps.push(v); cur.recent.push(v); if (cur.recent.length > 6) cur.recent.shift();
+    cur.ps.push(v); cur.recent.push(v); if (cur.recent.length > 10) cur.recent.shift();
     cur.maxR = Math.max(cur.maxR, r); cur.t1 = frames[i].t - hop / 2;
   }
   close();
-  if (notes.length >= 3) {
-    let sx = 0, sy = 0;
-    for (const n of notes) { const a = 2 * Math.PI * (n.p - Math.round(n.p)); sx += Math.cos(a) * n.d; sy += Math.sin(a) * n.d; }
-    const off = Math.atan2(sy, sx) / (2 * Math.PI);
-    for (const n of notes) n.p -= off;
-  }
   return notes;
 }
-function detectHits(y, sr) {
-  const W = 256, hop = 64, le = [];
-  for (let st = 0; st + W <= y.length; st += hop) {
-    let e = 0; for (let j = 0; j < W; j++) e += y[st + j] * y[st + j];
-    le.push(10 * Math.log10(e / W + 1e-10));
-  }
-  const floor = pct(le, 0.2), peak = Math.max(...le, -100);
-  const hits = []; let last = -1e9;
-  for (let n = 4; n < le.length; n++) {
-    const prevMin = Math.min(le[n - 1], le[n - 2], le[n - 3], le[n - 4]);
-    if (le[n] - prevMin > 7 && le[n] > Math.min(floor + 14, peak - 12) && le[n] > peak - 32 && (n - last) * hop / sr > 0.09) {
-      hits.push({ t: n * hop / sr, k: classify(y, n * hop, sr) }); last = n;
+function refineNotes(notes, ons) {
+  // Coupe une note tenue quand on réarticule (« da da ») et recale les attaques sur les vraies attaques
+  const out = [];
+  for (const n of notes) {
+    let parts = [n];
+    for (const o of ons) {
+      const last = parts[parts.length - 1];
+      if (o > last.t + 0.07 && o < last.t + last.d - 0.07) {
+        parts[parts.length - 1] = { p: last.p, t: last.t, d: o - last.t };
+        parts.push({ p: last.p, t: o, d: last.t + last.d - o });
+      }
+    }
+    for (const q of parts) {
+      let best = null;
+      for (const o of ons) { const dd = o - q.t; if (dd > -0.05 && dd < 0.06 && (best === null || Math.abs(dd) < Math.abs(best))) best = dd; }
+      if (best !== null) { q.t += best; q.d = Math.max(0.05, q.d - best); }
+      out.push(q);
     }
   }
-  return hits;
+  if (out.length >= 3) {
+    let sx = 0, sy = 0;
+    for (const n of out) { const a = 2 * Math.PI * (n.p - Math.round(n.p)); sx += Math.cos(a) * n.d; sy += Math.sin(a) * n.d; }
+    const off = Math.atan2(sy, sx) / (2 * Math.PI);
+    for (const n of out) n.p -= off;
+  }
+  return out;
 }
-function classify(y, s0, sr) {
-  const len = Math.min(Math.round(0.04 * sr), y.length - s0 - 1);
-  let e = 0, h = 0;
-  for (let i = s0 + 1; i < s0 + len; i++) { e += y[i] * y[i]; const dv = y[i] - y[i - 1]; h += dv * dv; }
-  const ratio = Math.min(3.99, h / (e || 1e-12));
-  const fc = sr / (2 * Math.PI) * Math.acos(1 - ratio / 2);
-  return fc < 650 ? 'kick' : fc > 5000 ? 'hat' : 'snare';
+function features(y, s0, sr) {
+  const len = Math.min(Math.round(0.045 * sr), y.length - s0 - 1);
+  if (len < 32) return null;
+  const aL = 1 - Math.exp(-2 * Math.PI * 250 / sr), aH = 1 - Math.exp(-2 * Math.PI * 4000 / sr);
+  let e = 0, h = 0, lo = 0, hi = 0, lpL = 0, lpH = 0;
+  for (let i = s0 + 1; i < s0 + len; i++) {
+    const x = y[i]; e += x * x;
+    const dv = x - y[i - 1]; h += dv * dv;
+    lpL += aL * (x - lpL); lo += lpL * lpL;
+    lpH += aH * (x - lpH); const hp = x - lpH; hi += hp * hp;
+  }
+  if (e < 1e-10) return null;
+  const ratio = Math.min(3.99, h / e), fc = sr / (2 * Math.PI) * Math.acos(1 - ratio / 2);
+  return [Math.log2(Math.max(50, fc)), lo / e, hi / e];
+}
+function classifyF(f) {
+  if (!f) return 'snare';
+  const P = project.drumProfile;
+  if (P && P.kick && P.snare && P.hat) {
+    let best = 'snare', bd = Infinity;
+    for (const k of ['kick', 'snare', 'hat']) {
+      const c = P[k], dd = (f[0] - c[0]) ** 2 + ((f[1] - c[1]) * 3) ** 2 + ((f[2] - c[2]) * 3) ** 2;
+      if (dd < bd) { bd = dd; best = k; }
+    }
+    return best;
+  }
+  if (f[1] > 0.45) return 'kick';
+  if (f[2] > 0.35 || f[0] > Math.log2(5000)) return 'hat';
+  return 'snare';
+}
+function detectHits(y, sr) {
+  return onsets(y, sr, 7, 0.09).map(s => ({ t: s, k: classifyF(features(y, Math.max(0, Math.round((s - 0.006) * sr)), sr)) }));
 }
 function growBars(endBeat) {
   const need = Math.ceil(endBeat / 4 - 1e-6);
@@ -624,7 +808,8 @@ function analyzeInto(t, x, sr, align) {
   const s = spb();
   if (t.kind === 'mel') {
     const { y, sr: r } = downsample(x, sr, 11025);
-    let notes = segment(trackPitch(y, r)).map(n => ({ p: n.p, s: n.t / s, d: n.d / s }));
+    const ons = onsets(y, r, 6, 0.08);
+    let notes = refineNotes(segment(trackPitch(y, r)), ons).map(n => ({ p: n.p, s: n.t / s, d: n.d / s }));
     if (align && notes.length) { const sh = notes[0].s; notes.forEach(n => n.s -= sh); growBars(Math.max(...notes.map(n => n.s + n.d))); }
     t.raw = notes;
     t.info = notes.length ? `${notes.length} note${notes.length > 1 ? 's' : ''} détectée${notes.length > 1 ? 's' : ''}` : 'Aucune note détectée. Chantez plus près du micro, plus fort.';
@@ -676,6 +861,9 @@ function renderDeck() {
   k.replaceChildren(...opts.map(([v, l]) => el('option', { value: v, text: l })));
   k.value = project.key;
   $('#metro').setAttribute('aria-pressed', project.metro);
+  const cal = typeof project.latency === 'number';
+  $('#calib').setAttribute('aria-pressed', cal);
+  $('#calibTxt').textContent = calibrating && calibMsg && !learnMsg ? 'Écoute…' : cal ? 'Calé · ' + Math.round(project.latency * 1000) + ' ms' : 'Calibrer';
 }
 function renderNotices() {
   const box = $('#notices'); box.replaceChildren();
@@ -683,6 +871,13 @@ function renderNotices() {
     el('p', { text: 'Projet d’exemple : une basse, une mélodie et une batterie. Écoutez-le, puis chantez vos propres pistes.' }),
     el('button', { class: 'btn solid', text: 'Écouter', onclick: () => { if (!play) startTransport(); } }),
     el('button', { class: 'btn', text: 'Partir de zéro', onclick: () => { stopTransport(true); project = blankProject(project); save(); renderAll(); } })));
+  if (calibMsg) box.append(el('div', { class: 'notice' }, el('p', { text: calibMsg }),
+    calibrating ? null : el('button', { class: 'btn', text: 'OK', onclick: () => { calibMsg = ''; renderNotices(); } })));
+  if (learnMsg) box.append(el('div', { class: 'notice' }, el('p', { text: learnMsg }),
+    calibrating ? null : el('button', { class: 'btn', text: 'OK', onclick: () => { learnMsg = ''; renderNotices(); } })));
+  if (!project.example && typeof project.latency !== 'number' && !calibMsg) box.append(el('div', { class: 'notice' },
+    el('p', { text: 'Pour des notes bien calées sur le tempo, calibrez le micro une fois : 10 clics, vous tapez dans vos mains dessus.' }),
+    el('button', { class: 'btn solid', text: 'Calibrer', onclick: () => { learnMsg = ''; calibrate(); } })));
   if (micNote) box.append(el('div', { class: 'notice warn' },
     el('p', { text: 'Cette page n’a pas accès au micro. Enregistrez-vous avec le dictaphone du téléphone (en suivant le tempo), puis touchez « Importer » sur la piste. Le début du fichier est calé sur le premier temps.' })));
 }
@@ -723,7 +918,9 @@ function renderTracks() {
     const fileIn = el('input', { type: 'file', id: fid, class: 'vh', accept: 'audio/*,video/*,.m4a,.mp3,.wav,.aac,.caf,.ogg,.webm,.mp4', onchange: e => { const f = e.target.files && e.target.files[0]; if (f) importFile(t, f); e.target.value = ''; } });
     const imp = el('label', { class: 'btn imp', for: fid }, 'Importer', fileIn);
     const status = el('span', { class: 'status', text: t.info || (isMel ? 'Piste vide' : 'Grille vide') });
-    const sec = el('section', { class: 'track' + (isRec ? ' recording' : '') }, head, wrap, el('div', { class: 'tfoot' }, recBtn, imp, status));
+    const learn = isMel ? null : el('button', { class: 'btn', text: project.drumProfile ? 'Réapprendre mes sons' : 'Apprendre mes sons', onclick: () => { calibMsg = ''; learnDrums(); } });
+    if (learn && recId) learn.disabled = true;
+    const sec = el('section', { class: 'track' + (isRec ? ' recording' : '') }, head, wrap, el('div', { class: 'tfoot' }, recBtn, imp, learn, status));
     box.append(sec);
     lanes.set(t.id, { t, cv, wrap, status, color });
   }
@@ -814,6 +1011,8 @@ function drawLane({ t, cv, wrap, status, color }, tk, ph, b) {
       c.globalAlpha = 0.18; c.fillRect(0, 0, Math.min(b, loopBeats()) * bp, h); c.globalAlpha = 1;
       const lv = Math.min(1, (play.rec.level || 0) * 6);
       c.fillRect(0, h - 6, w * lv, 6);
+      drawLive(c, t, play.rec, bp, w, h, color, tk);
+      c.fillStyle = tk.rec; c.font = '600 13px ' + getComputedStyle(document.body).fontFamily; c.textBaseline = 'middle';
       c.fillText('● REC', 12, 16);
       status.textContent = 'Enregistrement · mesure ' + Math.min(project.bars, Math.floor(b / 4) + 1) + '/' + project.bars;
     }
@@ -821,6 +1020,40 @@ function drawLane({ t, cv, wrap, status, color }, tk, ph, b) {
   if (ph !== null) { c.fillStyle = tk.rec; c.fillRect(ph * bp, 0, 2, h); }
 }
 const lanesNotes = new Map();
+function drawLive(c, t, rec, bp, w, h, color, tk) {
+  const L = loopBeats();
+  if (t.kind === 'mel') {
+    const pts = rec.live.filter(p => p.b >= 0 && p.b <= L && !isNaN(p.m));
+    if (!pts.length) return;
+    let lo = Infinity, hi = -Infinity; for (const p of pts) { lo = Math.min(lo, p.m); hi = Math.max(hi, p.m); }
+    lo -= 2; hi += 2; if (hi - lo < 12) { const mid = (hi + lo) / 2; lo = mid - 6; hi = mid + 6; }
+    const Y = m => 6 + (hi - m) / (hi - lo) * (h - 18);
+    c.strokeStyle = color; c.lineWidth = 3; c.lineCap = 'round'; c.lineJoin = 'round';
+    c.beginPath(); let prev = null;
+    for (const p of rec.live) {
+      if (p.b < 0 || p.b > L) continue;
+      if (isNaN(p.m)) { prev = null; continue; }
+      const x = p.b * bp, y = Y(p.m);
+      if (prev && p.b - prev.b < 0.15 && Math.abs(p.m - prev.m) < 3) c.lineTo(x, y); else c.moveTo(x, y);
+      prev = p;
+    }
+    c.stroke();
+    if (!isNaN(rec.cur)) {
+      const name = noteName(Math.round(rec.cur) + 12 * rec.octave);
+      c.font = '800 22px ' + getComputedStyle(document.body).getPropertyValue('--display');
+      c.fillStyle = tk.ink; c.textAlign = 'right'; c.textBaseline = 'top';
+      c.fillText(name, Math.min(w, (c.canvas.parentElement.scrollLeft || 0) + c.canvas.parentElement.clientWidth) - 10, 8);
+      c.textAlign = 'left';
+    }
+  } else {
+    const sw = bp / 4;
+    for (const hit of rec.hits) {
+      if (hit.b < -0.125 || hit.b >= L) continue;
+      const st = Math.max(0, Math.round(hit.b * 4)), row = KINDS.findIndex(k => k.k === hit.k);
+      c.fillStyle = color; roundRect(c, st * sw + 1.5, row * ROW_H + 4, sw - 3, ROW_H - 8, 2.5); c.fill();
+    }
+  }
+}
 function roundRect(c, x, y, w, h, r) { c.beginPath(); c.moveTo(x + r, y); c.arcTo(x + w, y, x + w, y + h, r); c.arcTo(x + w, y + h, x, y + h, r); c.arcTo(x, y + h, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath(); }
 function frame() { drawAll(); if (play) requestAnimationFrame(frame); }
 
@@ -852,6 +1085,7 @@ $('#bpm').addEventListener('input', e => {
   $('#bpmOut').textContent = nb + ' bpm'; save(); drawAll();
 });
 $('#key').addEventListener('change', e => { project.key = e.target.value; save(); renderTracks(); });
+$('#calib').addEventListener('click', () => { learnMsg = ''; calibrate(); });
 $('#metro').addEventListener('click', () => { project.metro = !project.metro; save(); renderDeck(); });
 $('#addMel').addEventListener('click', () => { project.tracks.push(newMel('piano')); save(); renderTracks(); });
 $('#addDrum').addEventListener('click', () => { project.tracks.push(newDrums()); save(); renderTracks(); });
